@@ -1,0 +1,30 @@
+# Secrets — never commit real switch credentials
+.env
+.env.local
+*.pem
+*.key
+
+# Operator/user artifacts. Snapshots, backups and audit logs describe a
+# specific switch; they belong in ZYXEL_SYNC_DIR / ZYXEL_BACKUP_DIR outside
+# this repository, not in the tool's source tree.
+switch-config/
+backups/
+audit.jsonl
+*.jsonl
+
+# Scratch captures from probing the web GUI
+*.html
+*.cfg
+*.bin
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/

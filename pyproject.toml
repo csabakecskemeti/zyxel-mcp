@@ -1,0 +1,36 @@
+[project]
+name = "zyxel-mcp"
+version = "0.5.0"
+description = "MCP server for safely reading and configuring Zyxel GS1900 series switches via their web GUI"
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.10"
+keywords = ["mcp", "zyxel", "gs1900", "switch", "network", "vlan"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: System Administrators",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Topic :: System :: Networking",
+]
+dependencies = [
+    "mcp>=1.0",
+    "requests>=2.31",
+    "beautifulsoup4>=4.12",
+]
+
+[project.urls]
+Homepage = "https://github.com/hugil/zyxel-mcp"
+Repository = "https://github.com/hugil/zyxel-mcp"
+Issues = "https://github.com/hugil/zyxel-mcp/issues"
+
+[project.scripts]
+mcp-zyxel = "mcp_zyxel.server:main"
+zyxel-mcp = "mcp_zyxel.server:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/mcp_zyxel"]
