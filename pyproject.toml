@@ -14,7 +14,7 @@ classifiers = [
     "Topic :: System :: Networking",
 ]
 dependencies = [
-    "mcp>=1.0",
+    "mcp>=1.0,<2",
     "requests>=2.31",
     "beautifulsoup4>=4.12",
 ]
