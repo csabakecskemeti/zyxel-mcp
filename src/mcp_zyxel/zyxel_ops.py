@@ -320,6 +320,35 @@ class ZyxelOps:
 
     # ---- maintenance: backup / save / reboot --------------------------------
 
+    def _stage_download(self, type_code: str, attempts: int = 3) -> "re.Match[str] | None":
+        """Ask the switch to stage a config/log file for HTTP download.
+
+        Firmware V2.70 stages only one export per web session, so a retry
+        starts a fresh login.
+        """
+        for attempt in range(attempts):
+            if attempt:
+                self.client.login()
+            self.client._ensure_login()
+            self.client.get_cmd(PAGE_BACKUP)
+            resp = self.client.session.post(
+                self.client._url(),
+                data={
+                    "XSSID": self.client.xssid,
+                    "cmd": str(PAGE_BACKUP_APPLY),
+                    "upmethod": "1",  # HTTP download (not TFTP)
+                    "type": type_code,
+                    "sysSubmit": "Apply",
+                },
+                timeout=self.client.config.timeout * 3,
+                verify=False,
+            )
+            self.client._token_stale = True
+            m = re.search(r'window\.location\.href = "([^"]+)"', resp.text)
+            if m:
+                return m
+        return None
+
     def backup_config(self, content: str = "running") -> dict[str, Any]:
         """Download a config/log backup over HTTP and store it in the backup
         dir. content: running|startup|backup|flash_log|buffer_log|tech_support.
@@ -328,20 +357,7 @@ class ZyxelOps:
             raise ValueError(f"content must be one of {sorted(BACKUP_TYPES)}")
         import requests as _requests
 
-        self.client._ensure_login()
-        resp = self.client.session.post(
-            self.client._url(),
-            data={
-                "XSSID": self.client.xssid,
-                "cmd": str(PAGE_BACKUP_APPLY),
-                "upmethod": "1",  # HTTP download (not TFTP)
-                "type": BACKUP_TYPES[content],
-                "sysSubmit": "Apply",
-            },
-            timeout=self.client.config.timeout * 3,
-            verify=False,
-        )
-        m = re.search(r'window\.location\.href = "([^"]+)"', resp.text)
+        m = self._stage_download(BACKUP_TYPES[content])
         if not m:
             raise RuntimeError("switch did not stage a backup download")
         dl = self.client.session.get(
@@ -357,20 +373,7 @@ class ZyxelOps:
 
     def get_running_config_text(self) -> str:
         """Fetch the running configuration as text (for diffing/auditing)."""
-        self.client._ensure_login()
-        resp = self.client.session.post(
-            self.client._url(),
-            data={
-                "XSSID": self.client.xssid,
-                "cmd": str(PAGE_BACKUP_APPLY),
-                "upmethod": "1",
-                "type": BACKUP_TYPES["running"],
-                "sysSubmit": "Apply",
-            },
-            timeout=self.client.config.timeout * 3,
-            verify=False,
-        )
-        m = re.search(r'window\.location\.href = "([^"]+)"', resp.text)
+        m = self._stage_download(BACKUP_TYPES["running"])
         if not m:
             raise RuntimeError("switch did not stage a config download")
         dl = self.client.session.get(

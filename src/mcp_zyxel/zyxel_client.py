@@ -32,13 +32,17 @@ DISPATCHER = "/cgi-bin/dispatcher.cgi"
 _ALNUM = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
 
 
-def encode_password(password: str) -> str:
-    """Replicate the switch's login-page JS obfuscation of the password."""
+def encode_password(password: str, stride: int = 7, inclusive: bool = False) -> str:
+    """Replicate the switch's login-page JS obfuscation of the password.
+
+    Older firmware uses stride 7 and `i < 321 - len`; newer firmware stride 5
+    and `i <= 321 - len`.
+    """
     text: list[str] = []
     length = len(password)
     remaining = length
-    for i in range(1, 321 - length):
-        if i % 7 == 0 and remaining > 0:
+    for i in range(1, 321 - length + (1 if inclusive else 0)):
+        if i % stride == 0 and remaining > 0:
             remaining -= 1
             text.append(password[remaining])
         elif i == 123:
@@ -100,6 +104,9 @@ class ZyxelClient:
             "Mozilla/5.0 (compatible; mcp-zyxel/0.2)"
         )
         self.xssid: str | None = None
+        # Newer firmware rotates the form token after every submit (see _fresh_token).
+        self._rotating_token = False
+        self._token_stale = False
         self._logged_in_at: float = 0.0
         # GS1900 sessions idle-time out quickly; re-login if older than this.
         self._session_ttl = 240.0
@@ -123,6 +130,10 @@ class ZyxelClient:
         resp.raise_for_status()
         if self._is_login_page(resp.text):
             raise ZyxelAuthError("Switch returned the login page — session lost")
+        # Carry forward the newest hidden form token any page hands us.
+        t = re.search(r'name="XSSID"\s+value="([A-Za-z0-9]+)"', resp.text)
+        if t:
+            self.xssid = t.group(1)
         return resp.text
 
     def get(self, params: dict[str, Any]) -> str:
@@ -139,12 +150,23 @@ class ZyxelClient:
 
             check_write_cmd_allowed(cmd)
         self._ensure_login()
+        self._fresh_token()
         payload = {"XSSID": self.xssid}
         payload.update(data)
         resp = self.session.post(
             self._url(), data=payload, timeout=self.config.timeout, verify=False
         )
+        self._token_stale = True
         return self._check_response(resp)
+
+    def _fresh_token(self) -> None:
+        """On firmware that rotates the form token after each submit (V2.90),
+        re-read it from a form page before submitting again. Without this a
+        second submit (e.g. save-to-startup right after a change) is silently
+        ignored."""
+        if self._rotating_token and self._token_stale:
+            self.get_cmd(5901)  # read-only page that carries the token
+            self._token_stale = False
 
     def get_cmd(self, cmd: int) -> str:
         return self.get({"cmd": str(cmd)})
@@ -166,38 +188,89 @@ class ZyxelClient:
                              verify=False)
             self.session.cookies.clear()
             time.sleep(0.5)
-            self.session.get(base, params={"cmd": "0"}, timeout=self.config.timeout,
-                             verify=False)
-            resp = self.session.get(
-                base,
-                params={
-                    "login": "1",
-                    "username": self.config.username,
-                    "password": encode_password(self.config.password),
-                    "dummy": str(int(time.time() * 1000)),
-                },
-                timeout=self.config.timeout,
-                verify=False,
-            )
-            resp.raise_for_status()
-            time.sleep(1)
-            chk = self.session.get(
-                base, params={"login_chk": "1"}, timeout=self.config.timeout,
-                verify=False,
-            ).text.strip()
-            if "OK" not in chk:
-                raise ZyxelAuthError(f"Authentication failed (login_chk={chk!r})")
+            login_page = self.session.get(
+                base, params={"cmd": "0"}, timeout=self.config.timeout, verify=False
+            ).text
+            if "authId" in login_page:
+                self._login_authid(base)
+            else:
+                self._login_legacy(base)
             bootstrap = self.session.get(
                 base, params={"cmd": "1"}, timeout=self.config.timeout, verify=False
             ).text
             m = re.search(r'XSSID",\s*"([A-Za-z0-9]+)"', bootstrap)
-            if not m:
+            cookie_xssid = self.session.cookies.get("HTTP_XSSID")
+            if m:
+                self.xssid = m.group(1)
+                self.session.cookies.set("XSSID", self.xssid)
+            elif cookie_xssid:
+                # Newer firmware: the session rides on the HTTP_XSSID cookie, and forms
+                # carry a separate per-session hidden XSSID token. Scrape it once from
+                # a read-only form page (Backup). It rotates after each submit.
+                page = self.session.get(
+                    base, params={"cmd": "5901"}, timeout=self.config.timeout, verify=False
+                ).text
+                t = re.search(r'name="XSSID"\s+value="([A-Za-z0-9]+)"', page)
+                if not t:
+                    raise ZyxelAuthError("Logged in, but no form XSSID token found")
+                self.xssid = t.group(1)
+                self._rotating_token = True
+            else:
                 raise ZyxelAuthError("Login succeeded but no XSSID found")
-            self.xssid = m.group(1)
         except requests.RequestException as e:
             raise ZyxelRequestError(f"HTTP error during login: {e}") from e
-        self.session.cookies.set("XSSID", self.xssid)
+        self._token_stale = False
         self._logged_in_at = time.time()
+
+    def _login_legacy(self, base: str) -> None:
+        """V2.40-era firmware: GET login=1, then a single login_chk."""
+        resp = self.session.get(
+            base,
+            params={
+                "login": "1",
+                "username": self.config.username,
+                "password": encode_password(self.config.password),
+                "dummy": str(int(time.time() * 1000)),
+            },
+            timeout=self.config.timeout,
+            verify=False,
+        )
+        resp.raise_for_status()
+        time.sleep(1)
+        chk = self.session.get(
+            base, params={"login_chk": "1"}, timeout=self.config.timeout,
+            verify=False,
+        ).text.strip()
+        if "OK" not in chk:
+            raise ZyxelAuthError(f"Authentication failed (login_chk={chk!r})")
+
+    def _login_authid(self, base: str) -> None:
+        """Newer firmware (e.g. GS1900-24): POST login=true returns an authId,
+        then poll login_chk with it until OK or FAIL. Password encoding uses a
+        stride of 5 instead of 7."""
+        resp = self.session.post(
+            base,
+            data={
+                "username": self.config.username,
+                "password": encode_password(self.config.password, stride=5, inclusive=True),
+                "login": "true;",
+            },
+            timeout=self.config.timeout,
+            verify=False,
+        )
+        resp.raise_for_status()
+        auth_id = resp.text.strip()
+        for _ in range(10):
+            time.sleep(0.5 if _ == 0 else 2)
+            chk = self.session.post(
+                base, data={"authId": auth_id, "login_chk": "true"},
+                timeout=self.config.timeout, verify=False,
+            ).text
+            if "OK" in chk:
+                return
+            if "FAIL" in chk:
+                raise ZyxelAuthError("Authentication failed: username or password incorrect")
+        raise ZyxelAuthError(f"Authentication timed out (last login_chk={chk.strip()!r})")
 
     def logout(self) -> None:
         try:
@@ -227,9 +300,11 @@ class ZyxelClient:
             from .safety import check_write_cmd_allowed
 
             check_write_cmd_allowed(cmd)
+        self._fresh_token()
         payload = dict(form_data)
         payload.setdefault("XSSID", self.xssid)
         resp = self.session.post(
             self._url(), data=payload, timeout=self.config.timeout, verify=False
         )
+        self._token_stale = True
         return self._check_response(resp)
